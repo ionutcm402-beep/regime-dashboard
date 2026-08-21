@@ -3,5 +3,4 @@ plotly
 requests
 pandas
 numpy
-hmmlearn
 matplotlib
