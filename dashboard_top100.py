@@ -43,6 +43,15 @@ days_history = st.sidebar.selectbox("History length per coin", [180, 365, 730], 
 request_delay = st.sidebar.slider("Delay between API calls (sec)", 0.5, 3.0, 1.3, step=0.1,
                                    help="Higher = slower scan but safer against CoinGecko rate limits.")
 
+api_key = st.sidebar.text_input(
+    "CoinGecko API key (optional, recommended)",
+    type="password",
+    help="Free at coingecko.com/en/developers/dashboard. Without a key you're "
+         "sharing the anonymous public rate limit with everyone else on this "
+         "cloud host's IP, so expect more failed coins. A free 'Demo' key "
+         "gives you your own dedicated, much higher limit.",
+)
+
 run_scan = st.sidebar.button("Run scan", type="primary")
 
 st.sidebar.markdown("---")
@@ -71,6 +80,7 @@ if run_scan:
             days=days_history,
             request_delay=request_delay,
             progress_callback=_update_progress,
+            api_key=api_key if api_key else None,
         )
     st.session_state["scan_table"] = table
     st.session_state["scan_time"] = datetime.now(timezone.utc)

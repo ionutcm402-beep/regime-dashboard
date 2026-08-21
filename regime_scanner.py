@@ -32,7 +32,32 @@ MIN_OBSERVATIONS = 40  # minimum daily data points needed for a trustworthy HMM 
 # CoinGecko fetch helpers (network -- run these on your own machine)
 # ---------------------------------------------------------------------
 
-def fetch_top_coins(n=100, vs_currency="usd"):
+def _request_with_retry(url, params, api_key=None, max_retries=4, base_wait=8):
+    """
+    GET with retry-on-429 (rate limit) using exponential backoff. Respects a
+    Retry-After header if the server sends one. Raises on any other HTTP error,
+    or if retries are exhausted.
+    """
+    headers = {}
+    if api_key:
+        # CoinGecko's free "Demo" API key header
+        headers["x-cg-demo-api-key"] = api_key
+
+    for attempt in range(max_retries + 1):
+        resp = requests.get(url, params=params, headers=headers, timeout=20)
+        if resp.status_code != 429:
+            resp.raise_for_status()
+            return resp
+        # Rate limited -- wait and retry
+        retry_after = resp.headers.get("Retry-After")
+        wait = float(retry_after) if retry_after else base_wait * (2 ** attempt)
+        if attempt < max_retries:
+            time.sleep(wait)
+        else:
+            resp.raise_for_status()  # exhausted retries -> raise the 429
+
+
+def fetch_top_coins(n=100, vs_currency="usd", api_key=None):
     """Returns a list of dicts: id, symbol, name, market_cap_rank, current_price."""
     coins = []
     per_page = 100  # CoinGecko max per page
@@ -45,19 +70,17 @@ def fetch_top_coins(n=100, vs_currency="usd"):
             "page": page,
             "sparkline": "false",
         }
-        resp = requests.get(COINGECKO_MARKETS_URL, params=params, timeout=20)
-        resp.raise_for_status()
+        resp = _request_with_retry(COINGECKO_MARKETS_URL, params, api_key=api_key)
         coins.extend(resp.json())
         if len(coins) >= n:
             break
     return coins[:n]
 
 
-def fetch_price_history(coin_id, days=365, vs_currency="usd"):
+def fetch_price_history(coin_id, days=365, vs_currency="usd", api_key=None):
     """Returns a DataFrame with columns: date, close -- daily granularity."""
     params = {"vs_currency": vs_currency, "days": days}
-    resp = requests.get(COINGECKO_CHART_URL.format(id=coin_id), params=params, timeout=20)
-    resp.raise_for_status()
+    resp = _request_with_retry(COINGECKO_CHART_URL.format(id=coin_id), params, api_key=api_key)
     data = resp.json()
     prices = data.get("prices", [])
     if not prices:
@@ -171,20 +194,21 @@ def build_ranking_table(coin_meta_list, price_histories, today=None):
 # Orchestration (network -- run on your own machine)
 # ---------------------------------------------------------------------
 
-def scan_top_coins(n=100, days=365, request_delay=1.3, progress_callback=None):
+def scan_top_coins(n=100, days=365, request_delay=1.3, progress_callback=None, api_key=None):
     """
     Full pipeline: fetch top N coins, fetch each one's history, fit regimes,
     return the ranked table. request_delay throttles calls to stay under
-    CoinGecko's free-tier rate limit.
+    CoinGecko's free-tier rate limit. Failed fetches retry automatically
+    with backoff before being counted as a real failure.
     progress_callback(i, n, coin_symbol) is called after each coin, if provided.
     """
-    coin_meta_list = fetch_top_coins(n=n)
+    coin_meta_list = fetch_top_coins(n=n, api_key=api_key)
     price_histories = {}
 
     for i, meta in enumerate(coin_meta_list):
         cid = meta["id"]
         try:
-            price_histories[cid] = fetch_price_history(cid, days=days)
+            price_histories[cid] = fetch_price_history(cid, days=days, api_key=api_key)
         except Exception as e:
             price_histories[cid] = pd.DataFrame(columns=["date", "close"])
             if progress_callback:
