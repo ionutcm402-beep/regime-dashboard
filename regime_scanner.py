@@ -25,6 +25,11 @@ from regime_model import fit_hmm
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
 COINGECKO_SEARCH_URL = "https://api.coingecko.com/api/v3/search"
+COINGECKO_DETAIL_URL = "https://api.coingecko.com/api/v3/coins/{id}"
+
+# Phase 2: content enrichment
+CRYPTOCOMPARE_NEWS_URL = "https://min-api.cryptocompare.com/data/v2/news/"
+YOUTUBE_SEARCH_URL = "https://www.googleapis.com/youtube/v3/search"
 
 MIN_OBSERVATIONS = 40  # minimum daily data points needed for a trustworthy HMM fit
 
@@ -56,6 +61,112 @@ def _request_with_retry(url, params, api_key=None, max_retries=4, base_wait=8):
             time.sleep(wait)
         else:
             resp.raise_for_status()  # exhausted retries -> raise the 429
+
+
+def fetch_coin_details(coin_id, api_key=None):
+    """
+    Fetch the rich per-coin profile: description, homepage link, and current
+    market stats (price, market cap, ATH, supply). Used on-demand for a
+    single coin's detail view -- NOT called during the bulk scan, since that
+    would be one extra API call per coin and slow the scan down a lot.
+    Returns None if the fetch fails.
+    """
+    params = {
+        "localization": "false", "tickers": "false", "community_data": "false",
+        "developer_data": "false", "sparkline": "false", "market_data": "true",
+    }
+    try:
+        resp = _request_with_retry(COINGECKO_DETAIL_URL.format(id=coin_id), params, api_key=api_key)
+    except Exception:
+        return None
+    data = resp.json()
+
+    md = data.get("market_data", {}) or {}
+    description = (data.get("description", {}) or {}).get("en", "") or ""
+    # Trim to a reasonable length -- some descriptions run thousands of words
+    if len(description) > 600:
+        description = description[:600].rsplit(".", 1)[0] + "."
+
+    homepage_list = (data.get("links", {}) or {}).get("homepage", []) or []
+    homepage = next((h for h in homepage_list if h), None)
+
+    return {
+        "description": description,
+        "homepage": homepage,
+        "current_price": (md.get("current_price") or {}).get("usd"),
+        "market_cap": (md.get("market_cap") or {}).get("usd"),
+        "ath": (md.get("ath") or {}).get("usd"),
+        "ath_date": (md.get("ath_date") or {}).get("usd"),
+        "circulating_supply": md.get("circulating_supply"),
+        "total_supply": md.get("total_supply"),
+        "max_supply": md.get("max_supply"),
+    }
+
+
+def fetch_coin_news(symbol, limit=3):
+    """
+    Fetch recent news headlines mentioning this coin, via CryptoCompare's free
+    news API (no key required). Returns a list of dicts: title, url, source,
+    published (datetime). Returns [] on any failure -- news is a nice-to-have,
+    never worth crashing the page over.
+    """
+    try:
+        params = {"lang": "EN", "categories": symbol.upper()}
+        resp = requests.get(CRYPTOCOMPARE_NEWS_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    articles = data.get("Data", [])[:limit]
+    out = []
+    for a in articles:
+        published = None
+        if a.get("published_on"):
+            published = datetime.fromtimestamp(a["published_on"], tz=timezone.utc)
+        out.append({
+            "title": a.get("title"),
+            "url": a.get("url"),
+            "source": (a.get("source_info") or {}).get("name") or a.get("source"),
+            "published": published,
+        })
+    return out
+
+
+def fetch_youtube_videos(query, api_key, limit=3):
+    """
+    Fetch the top N most relevant YouTube videos for a search query. Requires
+    a free Google/YouTube Data API v3 key -- returns [] if no key is given or
+    the request fails, rather than raising (never crash the page over an
+    optional enrichment feature).
+    """
+    if not api_key:
+        return []
+    try:
+        params = {
+            "part": "snippet", "q": query, "type": "video",
+            "maxResults": limit, "order": "relevance", "key": api_key,
+        }
+        resp = requests.get(YOUTUBE_SEARCH_URL, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    out = []
+    for item in data.get("items", [])[:limit]:
+        video_id = (item.get("id") or {}).get("videoId")
+        if not video_id:
+            continue
+        snippet = item.get("snippet", {})
+        thumb = (snippet.get("thumbnails", {}).get("medium") or snippet.get("thumbnails", {}).get("default") or {}).get("url")
+        out.append({
+            "title": snippet.get("title"),
+            "channel": snippet.get("channelTitle"),
+            "url": f"https://www.youtube.com/watch?v={video_id}",
+            "thumbnail": thumb,
+        })
+    return out
 
 
 def search_coins(query, api_key=None, limit=8):
@@ -195,8 +306,15 @@ def build_ranking_table(coin_meta_list, price_histories, today=None):
             "symbol": meta.get("symbol", "").upper(),
             "name": meta.get("name"),
             "id": cid,
+            "image": meta.get("image"),
             "price": fit["latest_price"],
             "change_24h_pct": meta.get("price_change_percentage_24h"),
+            "market_cap": meta.get("market_cap"),
+            "ath": meta.get("ath"),
+            "ath_date": meta.get("ath_date"),
+            "circulating_supply": meta.get("circulating_supply"),
+            "total_supply": meta.get("total_supply"),
+            "max_supply": meta.get("max_supply"),
             "state": fit["state_label"],
             "confidence_pct": round(fit["confidence"] * 100, 1),
             "streak_days": fit["streak_days"],
