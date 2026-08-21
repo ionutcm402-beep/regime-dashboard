@@ -29,7 +29,7 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from hmmlearn.hmm import GaussianHMM
+from simple_hmm import SimpleGaussianHMM as GaussianHMM
 
 
 # ----------------------------------------------------------------------
