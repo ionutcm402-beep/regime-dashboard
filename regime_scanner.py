@@ -24,6 +24,7 @@ from regime_model import fit_hmm
 
 COINGECKO_MARKETS_URL = "https://api.coingecko.com/api/v3/coins/markets"
 COINGECKO_CHART_URL = "https://api.coingecko.com/api/v3/coins/{id}/market_chart"
+COINGECKO_SEARCH_URL = "https://api.coingecko.com/api/v3/search"
 
 MIN_OBSERVATIONS = 40  # minimum daily data points needed for a trustworthy HMM fit
 
@@ -55,6 +56,29 @@ def _request_with_retry(url, params, api_key=None, max_retries=4, base_wait=8):
             time.sleep(wait)
         else:
             resp.raise_for_status()  # exhausted retries -> raise the 429
+
+
+def search_coins(query, api_key=None, limit=8):
+    """
+    Search CoinGecko for coins matching a free-text query (name or symbol).
+    Returns a list of dicts: id, symbol, name, market_cap_rank, thumb.
+    """
+    if not query or not query.strip():
+        return []
+    params = {"query": query.strip()}
+    resp = _request_with_retry(COINGECKO_SEARCH_URL, params, api_key=api_key)
+    data = resp.json()
+    coins = data.get("coins", [])[:limit]
+    return [
+        {
+            "id": c.get("id"),
+            "symbol": (c.get("symbol") or "").upper(),
+            "name": c.get("name"),
+            "market_cap_rank": c.get("market_cap_rank"),
+            "thumb": c.get("thumb"),
+        }
+        for c in coins
+    ]
 
 
 def fetch_top_coins(n=100, vs_currency="usd", api_key=None):
@@ -172,11 +196,12 @@ def build_ranking_table(coin_meta_list, price_histories, today=None):
             "name": meta.get("name"),
             "id": cid,
             "price": fit["latest_price"],
+            "change_24h_pct": meta.get("price_change_percentage_24h"),
             "state": fit["state_label"],
             "confidence_pct": round(fit["confidence"] * 100, 1),
             "streak_days": fit["streak_days"],
             "median_days_to_flip": round(fit["median_days_to_flip"], 1),
-            "flip_date": flip_date_median.date().isoformat(),
+            "flip_date": flip_date_median.strftime("%d/%m/%Y"),
             "n_obs": fit["n_obs"],
         })
 

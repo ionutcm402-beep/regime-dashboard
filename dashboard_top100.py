@@ -17,27 +17,98 @@ streamlit run dashboard_top100.py
 """
 
 from datetime import datetime, timezone
+import time
 
 import pandas as pd
 import streamlit as st
 
-from regime_scanner import scan_top_coins, fit_regime_from_prices, fetch_price_history
+from regime_scanner import scan_top_coins, fit_regime_from_prices, fetch_price_history, search_coins
 import plotly.graph_objects as go
 
 
-st.set_page_config(page_title="Top Coins Regime Scanner", layout="wide")
+st.set_page_config(page_title="Top Coins Regime Scanner", page_icon="🪙", layout="wide")
 
-st.title("Top Coins: Calm vs Volatile Regime Scanner")
+st.title("🪙 Top Coins: Calm vs Volatile Regime Scanner")
 st.caption(
     "Punctuated-equilibrium Markov model applied across the top coins by market cap. "
     "Sorted by theoretical time-to-flip -- most urgent at the top."
 )
 
 # ---------------------------------------------------------------------
+# Quick single-coin search (independent of the full scan below)
+# ---------------------------------------------------------------------
+
+st.markdown("### 🔍 Quick look-up: check any single coin")
+search_col1, search_col2 = st.columns([3, 1])
+with search_col1:
+    search_query = st.text_input(
+        "Search by name or symbol", placeholder="e.g. dogecoin, PEPE, chainlink...",
+        label_visibility="collapsed",
+    )
+with search_col2:
+    search_clicked = st.button("🔎 Search", use_container_width=True)
+
+if search_clicked and search_query:
+    with st.spinner(f"Searching for '{search_query}'..."):
+        try:
+            matches = search_coins(search_query)
+        except Exception as e:
+            matches = []
+            st.error(f"Search failed: {e}")
+    st.session_state["search_matches"] = matches
+    st.session_state["search_query_used"] = search_query
+
+if st.session_state.get("search_matches"):
+    matches = st.session_state["search_matches"]
+    if not matches:
+        st.warning(f"No coins found matching '{st.session_state.get('search_query_used', '')}'.")
+    else:
+        options = [f"{m['name']} ({m['symbol']})" for m in matches]
+        picked = st.selectbox("Matches found -- pick one:", options, key="search_pick")
+        picked_coin = matches[options.index(picked)]
+
+        if st.button("📊 Load regime for this coin"):
+            with st.spinner(f"Fetching history for {picked_coin['name']}..."):
+                try:
+                    price_df = fetch_price_history(picked_coin["id"], days=365)
+                    fit = fit_regime_from_prices(price_df)
+                except Exception as e:
+                    fit = None
+                    st.error(f"Couldn't fetch data: {e}")
+
+            if fit is None and price_df is not None:
+                st.warning("Not enough price history to fit a reliable model for this coin.")
+            elif fit is not None:
+                emoji = "🟢" if fit["state_label"] == "calm" else "🔴"
+                mood = "Calm" if fit["state_label"] == "calm" else "Volatile"
+
+                st.markdown(f"## {emoji} {picked_coin['name']} ({picked_coin['symbol']}) -- currently **{mood}**")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("💰 Price", f"${fit['latest_price']:,.4f}")
+                c2.metric(f"{emoji} State", mood, f"{fit['confidence']*100:.1f}% confidence")
+                c3.metric("🔥 Current streak", f"{fit['streak_days']} days")
+                c4.metric("⏳ Median days to flip", f"{fit['median_days_to_flip']:.1f}")
+
+                d = fit["df"]
+                fig = go.Figure()
+                for s_val, s_name, color in [(0, "🟢 Calm", "#4c6ef5"), (1, "🔴 Volatile", "#d6336c")]:
+                    mask = fit["hidden_states"] == s_val
+                    fig.add_trace(go.Scatter(
+                        x=d.loc[mask, "date"], y=d.loc[mask, "close"],
+                        mode="markers", name=s_name, marker=dict(size=5, color=color),
+                    ))
+                fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=10),
+                                   legend=dict(orientation="h", y=1.05))
+                st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+st.markdown("### 📋 Full market scan")
+
+# ---------------------------------------------------------------------
 # Sidebar controls
 # ---------------------------------------------------------------------
 
-st.sidebar.header("Scan settings")
+st.sidebar.header("⚙️ Scan settings")
 n_coins = st.sidebar.slider("Number of top coins to scan", 10, 100, 100, step=10)
 days_history = st.sidebar.selectbox("History length per coin", [180, 365, 730], index=1)
 request_delay = st.sidebar.slider("Delay between API calls (sec)", 0.5, 3.0, 1.3, step=0.1,
@@ -50,6 +121,14 @@ api_key = st.sidebar.text_input(
          "sharing the anonymous public rate limit with everyone else on this "
          "cloud host's IP, so expect more failed coins. A free 'Demo' key "
          "gives you your own dedicated, much higher limit.",
+)
+
+exclude_stablecoins = st.sidebar.checkbox(
+    "Exclude stablecoins",
+    value=True,
+    help="Stablecoins (USDT, USDC, USDS, etc.) barely move by design, so the "
+         "regime model has little real signal to work with for them -- their "
+         "'calm' classification is technically correct but not very meaningful.",
 )
 
 run_scan = st.sidebar.button("Run scan", type="primary")
@@ -69,10 +148,15 @@ st.sidebar.caption(
 if run_scan:
     progress_bar = st.progress(0, text="Starting scan...")
     status_text = st.empty()
+    timer_text = st.empty()
+
+    scan_start = time.time()
 
     def _update_progress(i, n, label):
+        elapsed = time.time() - scan_start
         progress_bar.progress(i / n, text=f"Fetching {label} ({i}/{n})...")
         status_text.text(f"Last processed: {label}")
+        timer_text.markdown(f"⏱️ **Elapsed: {elapsed:.1f} sec**")
 
     with st.spinner("Scanning..."):
         table = scan_top_coins(
@@ -82,10 +166,16 @@ if run_scan:
             progress_callback=_update_progress,
             api_key=api_key if api_key else None,
         )
+
+    scan_duration = time.time() - scan_start
     st.session_state["scan_table"] = table
+    st.session_state["exclude_stablecoins"] = exclude_stablecoins
     st.session_state["scan_time"] = datetime.now(timezone.utc)
+    st.session_state["scan_duration_sec"] = scan_duration
     progress_bar.empty()
     status_text.empty()
+    timer_text.empty()
+    st.toast(f"✅ Scan finished in {scan_duration:.1f} seconds ({len(table)} coins)", icon="⏱️")
 
 
 # ---------------------------------------------------------------------
@@ -97,13 +187,25 @@ if "scan_table" not in st.session_state:
     st.stop()
 
 table = st.session_state["scan_table"]
+
+# Known major stablecoins -- filtered by CoinGecko id, which is stable across renames
+_STABLECOIN_IDS = {
+    "tether", "usd-coin", "usds", "dai", "binance-usd", "true-usd", "frax",
+    "usdd", "gemini-dollar", "paypal-usd", "first-digital-usd", "usde",
+    "ethena-usde", "usdb", "fdusd", "pyusd", "tusd", "usdp", "susds",
+}
+if st.session_state.get("exclude_stablecoins", True):
+    table = table[~table["id"].isin(_STABLECOIN_IDS)].reset_index(drop=True)
 scan_time = st.session_state["scan_time"]
 
 if table.empty:
     st.warning("No coins returned enough data to fit a reliable model. Try increasing history length.")
     st.stop()
 
-st.caption(f"Last scanned: {scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')} -- {len(table)} coins with valid fits")
+st.caption(
+    f"Last scanned: {scan_time.strftime('%Y-%m-%d %H:%M:%S UTC')} -- {len(table)} coins with valid fits "
+    f"-- took {st.session_state.get('scan_duration_sec', 0):.1f} sec ⏱️"
+)
 
 # Live countdown: recompute "days remaining" relative to right now, not scan time
 now = datetime.now(timezone.utc)
@@ -113,11 +215,20 @@ display_table["days_remaining"] = (display_table["median_days_to_flip"] - elapse
 display_table["days_remaining"] = display_table["days_remaining"].clip(lower=0)
 display_table = display_table.sort_values("days_remaining", ascending=True).reset_index(drop=True)
 
+# Add emoji prefixes for a friendlier visual read
+display_table["state"] = display_table["state"].map(
+    lambda s: f"🟢 calm" if s == "calm" else f"🔴 volatile"
+)
+display_table["change_24h_pct_display"] = display_table["change_24h_pct"].map(
+    lambda v: f"📈 +{v:.2f}%" if pd.notna(v) and v >= 0 else (f"📉 {v:.2f}%" if pd.notna(v) else "—")
+)
 
-display_cols = ["rank", "symbol", "name", "price", "state", "confidence_pct",
+
+display_cols = ["rank", "symbol", "name", "price", "change_24h_pct_display", "state", "confidence_pct",
                  "streak_days", "days_remaining", "flip_date"]
 col_labels = {
     "rank": "Mkt Cap Rank", "symbol": "Symbol", "name": "Name", "price": "Price (USD)",
+    "change_24h_pct_display": "24h Change",
     "state": "State", "confidence_pct": "Confidence %", "streak_days": "Current Streak (days)",
     "days_remaining": "Days Until Theoretical Flip", "flip_date": "Flip Date (median)",
 }
@@ -125,14 +236,17 @@ col_labels = {
 def highlight_state(row):
     # row is a full row of the RENAMED dataframe -- must return one color
     # per column in this row, not per key in some smaller lookup dict.
-    color = "#d3f9d8" if row["State"] == "calm" else "#ffe3e3"
+    color = "#d3f9d8" if "calm" in row["State"] else "#ffe3e3"
     return [f"background-color: {color}"] * len(row)
 
 styled = (
     display_table[display_cols]
     .rename(columns=col_labels)
     .style.apply(highlight_state, axis=1)
-    .format({"Price (USD)": "${:,.4f}", "Confidence %": "{:.1f}%", "Days Until Theoretical Flip": "{:.1f}"})
+    .format({"Price (USD)": "${:,.4f}",
+              "Confidence %": "{:.1f}%", "Days Until Theoretical Flip": "{:.1f}"})
+    .set_properties(**{"text-align": "center"})
+    .set_table_styles([{"selector": "th", "props": [("text-align", "center")]}])
 )
 
 st.dataframe(styled, use_container_width=True, height=min(45 * (len(display_table) + 1), 900))
