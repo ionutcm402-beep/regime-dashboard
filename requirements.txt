@@ -1,0 +1,6 @@
+streamlit
+plotly
+requests
+pandas
+numpy
+hmmlearn
